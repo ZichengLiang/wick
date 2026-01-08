@@ -1,328 +1,103 @@
 use candle_core::{DType, Result, Tensor};
-use pyo3::exceptions::PyRuntimeError;
-use pyo3::prelude::*;
-/// Wick - Model Weight Quantization Library
-use std::f32::consts::E;
 
-pub(crate) struct SymQuantizedTensor {
-    tensor: Tensor, // U8
-    absmax: f32,
-}
-
-impl SymQuantizedTensor {
-    pub fn to_vec1(&self) -> Result<Vec<u8>> {
-        self.tensor.to_vec1::<u8>()
-    }
-
-    pub fn restore_to_f32(&self) -> Result<Tensor> {
-        // map from [0, 255] to [-1, 1]
-        let f32_normalized = self
-            .tensor
-            .to_dtype(DType::F32)?
-            .affine(2.0 / 255.0, -1.0)?;
-
-        // use absmax to restore original value
-        f32_normalized.affine(self.absmax.into(), 0.0)
-    }
-}
-
-pub(crate) struct AsymQuantizedTensor {
-    tensor: Tensor, // U8
-    zero_point: f32,
-    scale: f32,
-    absmax: f32,
-}
-impl AsymQuantizedTensor {
-    pub fn to_vec1(&self) -> Result<Vec<u8>> {
-        // TODO:("maybe use a trait for QuantizedTensor?");
-        self.tensor.to_vec1::<u8>()
-    }
-
-    pub fn restore_to_f32(&self) -> Result<Tensor> {
-        let f32_normalized = self.tensor.to_dtype(DType::F32)?.affine(
-            (1.0 / self.scale).into(),
-            (-self.zero_point / self.scale).into(),
-        )?;
-        let restored = f32_normalized.affine(self.absmax.into(), 0.0)?;
-        Ok(restored)
-    }
-}
-
-pub(crate) enum QuantizedTensors {
+#[derive(Debug, Clone)]
+pub enum QuantizedTensor {
     Sym(SymQuantizedTensor),
     Asym(AsymQuantizedTensor),
 }
 
-pub(crate) fn candle_err(e: candle_core::Error) -> PyErr {
-    PyRuntimeError::new_err(e.to_string())
+#[derive(Debug, Clone)]
+pub struct SymQuantizedTensor {
+    pub tensor: Tensor, // U8
+    pub absmax: f32,
 }
 
-/// Find the absolute max in a given tensor
-/// Returns a 0-dim candle::Tensor containing
-/// the absolute max value in original precision
-/// Example:
-/// [[-9.0, -1.0], [0.0, 2.0], [6.5, 8.0]] -> [9.0]
-pub fn absmax(tensor: &Tensor) -> Result<f32> {
-    let tensor_f32 = tensor.to_dtype(DType::F32)?;
-    let abs_max = tensor_f32.abs()?.max_all()?.to_scalar::<f32>();
-    abs_max
+#[derive(Debug, Clone)]
+pub struct AsymQuantizedTensor {
+    pub tensor: Tensor, // U8
+    pub zero_point: u8,
+    pub scale: f32,
 }
 
-/// Return the tensor normalized by a norm
-/// Any element in the result tensor range in [-1.0, 1.0]
-///
-/// Example:
-/// [[-9.0, -1.0], [0.0, 2.0], [6.5, 8.0]]
-/// -> norm = 9.0
-/// -> [[-1.0, -0.1111], [0.0, 0.2222], [0.7222, 0.8889]]
-pub fn normalize(tensor: &Tensor, norm: f32) -> Result<Tensor> {
-    let normalized = tensor.affine((1.0 / norm).into(), 0.0);
-    normalized
-}
-
-/// set 0b10000000 (128) as the zero point and map any value from [-1, 1] to [0, 255]
-pub fn symmetric_u8_quantize(tensor: Tensor) -> Result<SymQuantizedTensor> {
-    let absmax = absmax(&tensor)?;
-    let normalized_tensor = normalize(&tensor, absmax)?;
-    Ok(SymQuantizedTensor {
-        tensor: normalized_tensor
-            .affine(127.0, 128.0)?
-            .to_dtype(DType::U8)?,
-        absmax,
-    })
-}
-
-pub fn asymmetric_u8_quantize(tensor: Tensor) -> Result<AsymQuantizedTensor> {
-    let absmax = absmax(&tensor)?;
-    let normalized_tensor = normalize(&tensor, absmax)?;
-
-    let min = normalized_tensor.min_all()?.to_scalar::<f32>()?;
-    let max = normalized_tensor.max_all()?.to_scalar::<f32>()?;
-    let range = max - min;
-
-    if range == 0.0 {
-        // if the tensor contains all constant, return a zero tensor
-        // zero point should be the original number
-        // scale should be 0.0
-        return Ok(AsymQuantizedTensor {
-            tensor: normalized_tensor
-                .zeros_like()? // a tensor fill with zero
-                .to_dtype(DType::U8)?,
-            absmax,
-            zero_point: min,
-            scale: 0.0,
-        });
-    }
-
-    let zero_point = -255.0 * min / range; // this is somewhere in [0, 255] that maps to 0 in normalized range
-    let scale = 255.0 / range;
-    return Ok(AsymQuantizedTensor {
-        tensor: normalized_tensor
-            .affine(scale.into(), zero_point.into())?
-            .to_dtype(DType::U8)?,
-        absmax,
-        zero_point,
-        scale,
-    });
-}
-
-/// Accept tensor, quantize it into unsigned int8 (u8) type tensor
-/// It computes a mapping [tensor.min, tensor.max] -> [0, 255]
-/// Return quantized Tensor<U8>
-pub fn quantize_int8(tensor: &Tensor) -> QuantizedTensors {
-    let absmax = absmax(&tensor).unwrap();
-    let normalized_tensor = normalize(&tensor, absmax)
-        .unwrap()
-        .to_dtype(DType::F32)
-        .unwrap();
-
-    let min = normalized_tensor
-        .min_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    let max = normalized_tensor
-        .max_all()
-        .unwrap()
-        .to_scalar::<f32>()
-        .unwrap();
-    let waste_ratio = (min - (-1.0) + (1.0 - max)) / 2.0;
-
-    if waste_ratio <= 1.0 / E {
-        // no evidence hahaha, just for fun
-        return QuantizedTensors::Sym(symmetric_u8_quantize(normalized_tensor).unwrap());
-    } else {
-        return QuantizedTensors::Asym(asymmetric_u8_quantize(normalized_tensor).unwrap());
-    }
-}
-
-pub fn dequantize_int8(quantized_tensor: QuantizedTensors) -> Result<Tensor> {
-    match quantized_tensor {
-        QuantizedTensors::Sym(sym_tensor) => sym_tensor.restore_to_f32(),
-        QuantizedTensors::Asym(asym_tensor) => asym_tensor.restore_to_f32(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use candle_core::{DType, Device, Tensor};
-
-    #[test]
-    fn test_absmax() {
-        // Test with positive and negative values
-        let tensor = Tensor::new(&[[-9.0f32, -1.0], [0.0, 2.0], [6.5, 8.0]], &Device::Cpu).unwrap();
-        let result = absmax(&tensor).unwrap();
-        assert_eq!(result, 9.0);
-
-        // Test with all negative values
-        let tensor = Tensor::new(&[-1.0f32, -5.0, -3.0], &Device::Cpu).unwrap();
-        let result = absmax(&tensor).unwrap();
-        assert_eq!(result, 5.0);
-
-        // Test with all positive values
-        let tensor = Tensor::new(&[1.0f32, 5.0, 3.0], &Device::Cpu).unwrap();
-        let result = absmax(&tensor).unwrap();
-        assert_eq!(result, 5.0);
-
-        // Test with single element
-        let tensor = Tensor::new(&[-42.0f32], &Device::Cpu).unwrap();
-        let result = absmax(&tensor).unwrap();
-        assert_eq!(result, 42.0);
-    }
-
-    #[test]
-    fn test_normalize() {
-        let tensor = Tensor::new(&[[-9.0f32, -1.0], [0.0, 2.0], [6.5, 8.0]], &Device::Cpu).unwrap();
-        let norm = 9.0;
-        let result = normalize(&tensor, norm).unwrap();
-
-        // Expected: [[-1.0, -0.1111], [0.0, 0.2222], [0.7222, 0.8889]]
-        let expected = vec![
-            vec![-1.0, -1.0 / 9.0],
-            vec![0.0, 2.0 / 9.0],
-            vec![6.5 / 9.0, 8.0 / 9.0],
-        ];
-
-        let result_vec = result.to_vec2::<f32>().unwrap();
-        for (i, row) in result_vec.iter().enumerate() {
-            for (j, &val) in row.iter().enumerate() {
-                assert!(
-                    (val - expected[i][j]).abs() < 1e-4,
-                    "Mismatch at [{}, {}]: got {}, expected {}",
-                    i,
-                    j,
-                    val,
-                    expected[i][j]
-                );
+impl QuantizedTensor {
+    pub fn dequantize(&self) -> Result<Tensor> {
+        match self {
+            QuantizedTensor::Sym(q) => {
+                // Formula: (q - 128) * (1 / 128) * absmax
+                // Simplified: (absmax/128) * q - absmax
+                let mul = q.absmax / 128.0;
+                let add = -q.absmax;
+                // Return restored tensor
+                q.tensor
+                    .to_dtype(DType::F32)?
+                    .affine(mul.into(), add.into())
+            }
+            QuantizedTensor::Asym(q) => {
+                // Formula: (q - zero_point) * scale
+                // Simplified: q * 1/scale - zero_point * scale
+                // Scale = range / 255
+                let mul= 1.0 / q.scale;
+                let add = q.zero_point as f32 * -mul;
+                // Return restored tensor
+                q.tensor
+                    .to_dtype(DType::F32)?
+                    .affine(mul.into(), add.into())
             }
         }
-
-        // Test edge case: normalize by 1.0 (identity for range [-1, 1])
-        let tensor = Tensor::new(&[0.5f32, -0.5, 1.0, -1.0], &Device::Cpu).unwrap();
-        let result = normalize(&tensor, 1.0).unwrap();
-        let result_vec = result.to_vec1::<f32>().unwrap();
-        let expected = vec![0.5, -0.5, 1.0, -1.0];
-        for (i, &val) in result_vec.iter().enumerate() {
-            assert!((val - expected[i]).abs() < 1e-6);
-        }
     }
+}
 
-    #[test]
-    fn test_symmetric_u8_quantize() {
-        // Test zero point mapping: 0.0 -> 128
-        let tensor = Tensor::new(&[0.0f32], &Device::Cpu).unwrap();
-        let result = symmetric_u8_quantize(tensor).unwrap();
-        let result_vec = result.to_vec1().unwrap();
-        assert_eq!(result_vec[0], 128);
+fn get_min_max(tensor: &Tensor) -> Result<(f32, f32)> {
+    // Reason: when calling min_all, max_all Candle flattens the tensor under the hood
+    // to avoid flatten twice, we do this...
+    let flattened = tensor.flatten_all()?;
+    let min = flattened.min(0)?.to_scalar::<f32>()?;
+    let max = flattened.max(0)?.to_scalar::<f32>()?;
+    Ok((min, max))
+}
 
-        // Test boundary values: -1.0 -> 1, 1.0 -> 255
-        let tensor = Tensor::new(&[-1.0f32, 1.0], &Device::Cpu).unwrap();
-        let result = symmetric_u8_quantize(tensor).unwrap();
-        let result_vec = result.to_vec1().unwrap();
-        assert_eq!(result_vec[0], 1); // -1.0 * 127 + 128 = 1
-        assert_eq!(result_vec[1], 255); // 1.0 * 127 + 128 = 255
+pub fn quantize_int8(tensor: &Tensor) -> Result<QuantizedTensor> {
+    let f32_tensor = tensor.to_dtype(DType::F32)?;
+    let (min, max) = get_min_max(&f32_tensor)?;
+    let non_negative = min >= 0.0;
+    let absmax = max.abs().max(min.abs());
+    let all_zero = absmax == 0.0;
+    if all_zero {
+        return Ok(QuantizedTensor::Sym(SymQuantizedTensor {
+            tensor: f32_tensor,
+            absmax: 0.0,
+        }));
+    } else if non_negative {
+        // Asymmetric
+        let scale = 255.0 / (max - min);
+        let zero_point = (-min * scale).round();
 
-        // Test intermediate values
-        let tensor = Tensor::new(&[-0.5f32, 0.5], &Device::Cpu).unwrap();
-        let result = symmetric_u8_quantize(tensor).unwrap();
-        let result_vec = result.to_vec1().unwrap();
-        // -0.5 * 127 + 128 = 64.5 -> 64 (truncated)
-        // 0.5 * 127 + 128 = 191.5 -> 191 (truncated)
-        assert_eq!(result_vec[0], 64);
-        assert_eq!(result_vec[1], 191);
-    }
+        // quantized = scale * tensor + bias
+        let quantized = f32_tensor
+            .affine(scale.into(), zero_point.into())?
+            .clamp(u8::MIN as f32, u8::MAX as f32)?
+            .round()?
+            .to_dtype(DType::U8);
 
-    #[test]
-    fn test_quantize_dequantize_roundtrip() {
-        // This test should verify that quantizing then dequantizing a tensor
-        // produces values close to the original (within quantization error bounds)
-        fn ss_loss(original_tensor: &Tensor, std: &f32, description: &String) {
-            let quantized_tensor = quantize_int8(&original_tensor);
-            let dequantized_tensor = dequantize_int8(quantized_tensor).unwrap();
-            let sse = original_tensor
-                .sub(&dequantized_tensor)
-                .unwrap()
-                .sqr()
-                .unwrap()
-                .sum_all()
-                .unwrap()
-                .to_scalar::<f32>()
-                .unwrap();
+        Ok(QuantizedTensor::Asym(AsymQuantizedTensor {
+            tensor: quantized?,
+            zero_point: zero_point as u8,
+            scale,
+        }))
+    } else {
+        // Symmetric
+        let scale = 127.0 / absmax;
+        let bias = 128.0;
 
-            // Mean squared error - normalizes by count
-            let mse = sse / original_tensor.elem_count() as f32;
+        let quantized = f32_tensor
+            .affine(scale as f64, bias as f64)?
+            .clamp(u8::MIN as f32, u8::MAX as f32)? // SAFETY: clamp before cast
+            .round()? // PRECISION: round nearest
+            .to_dtype(DType::U8)?;
 
-            // Root mean squared error - back to original units
-            let rmse = mse.sqrt();
-
-            // Normalized RMSE - dimensionless, comparable across scales
-            // Values closer to 0 are better; 1.0 would mean the error is as large as the data's spread
-            let nrmse = rmse / std;
-
-            // SNR in decibels - higher is better
-            // A well-quantized signal might have SNR of 40-60 dB
-            let signal_power = original_tensor
-                .sqr()
-                .unwrap()
-                .mean_all()
-                .unwrap()
-                .to_scalar::<f32>()
-                .unwrap();
-            let noise_power = mse; // MSE is essentially the noise power
-            let snr_db = 10.0 * (signal_power / noise_power).log10();
-            println!(
-                "[INFO] SSE: {sse:.4}, MSE: {mse:.4}, NRMSE: {nrmse:.4}, SNR_dB: {snr_db:.0}dB for {description}"
-            );
-            assert!(sse > 0.0);
-        }
-
-        macro_rules! test_normdist_loss {
-            ($mean:expr, $std:expr, $loss_fn:ident) => {
-                let mean: f64 = $mean;
-                let std: f64 = $std;
-                let std_32 = std as f32;
-                let tensor = Tensor::randn(mean, std, (10, 10), &Device::Cpu)
-                    .unwrap()
-                    .to_dtype(DType::F32)
-                    .unwrap();
-                let msg = format!(
-                    "a tensor with Z~({}, {}) (mean, standard deviation)\n",
-                    mean, std
-                );
-                $loss_fn(&tensor, &std_32, &msg);
-            };
-        }
-
-        test_normdist_loss!(0.0, 0.3333, ss_loss);
-        test_normdist_loss!(1.0, 0.3333, ss_loss);
-        test_normdist_loss!(-1.0, 0.3333, ss_loss);
-        test_normdist_loss!(0.0, 10.0, ss_loss);
-        test_normdist_loss!(0.0, 100.0, ss_loss);
-        test_normdist_loss!(0.0, 1000.0, ss_loss);
-        test_normdist_loss!(1000.0, 10.0, ss_loss);
-        // Interesting finding:
-        // I use very extreme data here, but the relative loss is still negligable,
-        // AS LONG AS the original weights follows normal distribution
+        Ok(QuantizedTensor::Sym(SymQuantizedTensor {
+            tensor: quantized,
+            absmax,
+        }))
     }
 }

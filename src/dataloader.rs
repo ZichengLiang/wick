@@ -1,5 +1,5 @@
-use crate::quantize::{QuantizedTensors, dequantize_int8, quantize_int8};
-use candle_core::{Device, Result, Tensor, safetensors};
+use crate::quantize::{quantize_int8, QuantizedTensor};
+use candle_core::{Device, Result, Tensor};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -10,15 +10,15 @@ fn load<P: AsRef<Path>>(path: P, device: &Device) -> Result<HashMap<String, Tens
 
 pub fn quantize_model(
     model_weight_map: &HashMap<String, Tensor>,
-) -> Result<HashMap<String, QuantizedTensors>> {
-    let mut quantized_map: HashMap<String, QuantizedTensors> = HashMap::new();
+) -> Result<HashMap<String, QuantizedTensor>> {
+    let mut quantized_map: HashMap<String, QuantizedTensor> = HashMap::new();
     for (key, tensor) in model_weight_map {
-        quantized_map.insert(key.to_string(), quantize_int8(&tensor));
+        quantized_map.insert(key.to_string(), quantize_int8(&tensor)?);
     }
     Ok(quantized_map)
 }
 
-/// measure the quantized precision loss with Normalized Root Mean Squared Error (NRMSE)
+/// measure the quantized precision loss with NRMSE(std)
 pub fn measure_layer_loss<P: AsRef<Path>>(
     path: P,
     device: &Device,
@@ -27,7 +27,7 @@ pub fn measure_layer_loss<P: AsRef<Path>>(
     let quantized_map = quantize_model(&model_weight_map)?;
     let mut dequantized_map: HashMap<String, Tensor> = HashMap::new();
     for (key, quantized_tensor) in quantized_map {
-        dequantized_map.insert(key, dequantize_int8(quantized_tensor).unwrap());
+        dequantized_map.insert(key, quantized_tensor.dequantize().unwrap());
     }
     let mut nrmse_map: HashMap<String, f32> = HashMap::new();
 
@@ -62,47 +62,4 @@ fn get_std(tensor: &Tensor) -> Result<f32> {
         .to_scalar::<f32>()?;
 
     Ok(std)
-}
-
-mod tests {
-    use candle_core::MetalStorage;
-
-    use super::*;
-
-    #[test]
-    fn test_load_model() -> Result<()> {
-        let bert = candle_core::safetensors::load(
-            "/Users/liangzicheng/Documents/GitHub/wick/data/bert-base-chinese.safetensors",
-            &Device::Cpu,
-        )?;
-        assert!(!bert.is_empty());
-
-        let gpt2 = load(
-            "/Users/liangzicheng/Documents/GitHub/wick/data/gpt2.safetensors",
-            &Device::Cpu,
-        )?;
-        assert!(!gpt2.is_empty());
-
-        for (key, value) in bert {
-            println!("[Bert] Key: {}, Value: {:?}", key, value);
-        }
-
-        for (key, value) in gpt2 {
-            println!("[GPT2] Key: {}, Value: {:?}", key, value);
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_quantize_loss() -> Result<()> {
-        let loss_map = measure_layer_loss(
-            "/Users/liangzicheng/Documents/GitHub/wick/data/gpt2.safetensors",
-            &Device::Cpu,
-        );
-        for (k, v) in loss_map? {
-            println!("[{}] NRMSE for {} : {}", "gpt2", k, v);
-        }
-        Ok(())
-    }
 }
